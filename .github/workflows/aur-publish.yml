@@ -9,6 +9,7 @@ on:
       - .gitignore
       - .SRCINFO
       - PKGBUILD
+      - README.md
   schedule:
     - cron: '23 */6 * * *'
   repository_dispatch:
@@ -265,6 +266,7 @@ jobs:
           pkgbuild: ./PKGBUILD
           assets: |
             .gitignore
+            README.md
           commit_username: ParticleG
           commit_email: particle_g@outlook.com
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

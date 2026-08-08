@@ -1,0 +1,22 @@
+pkgbase = relink-logs-appimage
+	pkgdesc = Overlay DPS parser and meter for Granblue Fantasy: Relink (AppImage)
+	pkgver = 1.12.9
+	pkgrel = 1
+	url = https://github.com/villith/relink-logs
+	arch = x86_64
+	license = MIT
+	depends = fuse2
+	depends = hicolor-icon-theme
+	provides = relink-logs
+	provides = gbfr-logs
+	conflicts = relink-logs
+	conflicts = gbfr-logs
+	noextract = relink-logs-appimage-1.12.9.AppImage
+	options = !strip
+	options = !debug
+	source = relink-logs-appimage-1.12.9.AppImage::https://github.com/villith/relink-logs/releases/download/1.12.9/gbfr-logs_1.12.9_amd64.AppImage
+	source = relink-logs-appimage-1.12.9.LICENSE::https://raw.githubusercontent.com/villith/relink-logs/1.12.9/LICENSE
+	sha256sums = 3c7dfa2242774031413fed2dd62a5f998f10e59f30c976ec5fad66385c2c3d3b
+	sha256sums = 810d9b66e3e6018cabcf3502aed71981222a33e0a4233499ebc537df316e09ad
+
+pkgname = relink-logs-appimage

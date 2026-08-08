@@ -1,0 +1,271 @@
+name: Update and publish AUR package
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/aur-publish.yml
+      - .gitignore
+      - .SRCINFO
+      - PKGBUILD
+  schedule:
+    - cron: '23 */6 * * *'
+  repository_dispatch:
+    types:
+      - upstream-release
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Publish the current recipe even when the upstream version is unchanged
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aur-publish-relink-logs-appimage
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: relink-logs-appimage
+  UPSTREAM_REPOSITORY: villith/relink-logs
+
+jobs:
+  update-and-publish:
+    name: Update, verify, and publish package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_json="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest")"
+          tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+          version="${tag#v}"
+
+          if [[ -z "$tag" || "$version" == *-* || ! "$version" =~ ^[0-9][0-9A-Za-z._+]*$ || ( "$tag" != "$version" && "$tag" != "v$version" ) ]]; then
+            printf 'Unsupported upstream release tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+
+          asset="gbfr-logs_${version}_amd64.AppImage"
+          if ! jq -e --arg asset "$asset" \
+            '.assets[] | select(.name == $asset)' \
+            <<<"$release_json" >/dev/null; then
+            printf 'Release %s does not contain %s\n' "$tag" "$asset" >&2
+            exit 1
+          fi
+
+          download_dir="$RUNNER_TEMP/relink-logs-release"
+          mkdir -p "$download_dir"
+          gh release download "$tag" \
+            --repo "$UPSTREAM_REPOSITORY" \
+            --pattern "$asset" \
+            --dir "$download_dir" \
+            --clobber
+          gh api \
+            --method GET \
+            -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${UPSTREAM_REPOSITORY}/contents/LICENSE" \
+            -f "ref=$tag" \
+            >"$download_dir/LICENSE"
+
+          appimage_sha256="$(sha256sum "$download_dir/$asset" | cut -d ' ' -f 1)"
+          license_sha256="$(sha256sum "$download_dir/LICENSE" | cut -d ' ' -f 1)"
+
+          cp "$download_dir/$asset" "$PACKAGE_NAME-$version.AppImage"
+          cp "$download_dir/LICENSE" "$PACKAGE_NAME-$version.LICENSE"
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'tag=%s\n' "$tag"
+            printf 'appimage_sha256=%s\n' "$appimage_sha256"
+            printf 'license_sha256=%s\n' "$license_sha256"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Update package recipe
+        env:
+          APPIMAGE_SHA256: ${{ steps.upstream.outputs.appimage_sha256 }}
+          LICENSE_SHA256: ${{ steps.upstream.outputs.license_sha256 }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("PKGBUILD")
+          text = path.read_text()
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          new_checksums = (
+              os.environ["APPIMAGE_SHA256"],
+              os.environ["LICENSE_SHA256"],
+          )
+
+          def require_match(pattern):
+              match = re.search(pattern, text, flags=re.MULTILINE)
+              if match is None:
+                  raise SystemExit(f"Missing required PKGBUILD field: {pattern!r}")
+              return match
+
+          current_version = require_match(r"^pkgver=(.+)$").group(1)
+          current_pkgrel = int(require_match(r"^pkgrel=([0-9]+)$").group(1))
+          current_tag_line = require_match(r"^_tag=.*$").group(0)
+          current_checksums = tuple(
+              re.findall(r"^  '([0-9a-f]{64})'$", text, flags=re.MULTILINE)
+          )
+          if len(current_checksums) != 2:
+              raise SystemExit(
+                  f"Expected two SHA-256 entries, found {len(current_checksums)}"
+              )
+
+          new_tag_line = (
+              '_tag="$pkgver"' if tag == version else '_tag="v$pkgver"'
+          )
+          if current_version != version:
+              pkgrel = 1
+          elif (
+              current_checksums != new_checksums
+              or current_tag_line != new_tag_line
+          ):
+              pkgrel = current_pkgrel + 1
+          else:
+              pkgrel = current_pkgrel
+
+          replacements = (
+              (r"^pkgver=.*$", f"pkgver={version}"),
+              (r"^pkgrel=.*$", f"pkgrel={pkgrel}"),
+              (r"^_tag=.*$", new_tag_line),
+          )
+          for pattern, replacement in replacements:
+              text, count = re.subn(
+                  pattern,
+                  replacement,
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(
+                      f"Expected one match for {pattern!r}, found {count}"
+                  )
+
+          checksums = iter(new_checksums)
+          text, count = re.subn(
+              r"^  '[0-9a-f]{64}'$",
+              lambda _: f"  '{next(checksums)}'",
+              text,
+              flags=re.MULTILINE,
+          )
+          if count != 2:
+              raise SystemExit(f"Expected two SHA-256 entries, found {count}")
+
+          path.write_text(text)
+          PY
+
+      - name: Generate SRCINFO
+        run: |
+          set -euo pipefail
+
+          srcinfo_dir="$RUNNER_TEMP/package-srcinfo"
+          rm -rf "$srcinfo_dir"
+          mkdir -p "$srcinfo_dir"
+          cp PKGBUILD "$srcinfo_dir/"
+
+          docker run --rm \
+            --env BUILD_UID="$(id -u)" \
+            --volume "$srcinfo_dir:/pkg" \
+            --workdir /pkg \
+            archlinux:base-devel \
+            bash -euc '
+              useradd --uid "$BUILD_UID" --create-home builder
+              runuser -u builder -- makepkg --printsrcinfo
+            ' >.SRCINFO
+
+      - name: Build and validate package
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          build_dir="$RUNNER_TEMP/package-build"
+          rm -rf "$build_dir"
+          mkdir -p "$build_dir"
+          cp \
+            PKGBUILD \
+            "$PACKAGE_NAME-$VERSION.AppImage" \
+            "$PACKAGE_NAME-$VERSION.LICENSE" \
+            "$build_dir/"
+
+          docker run --rm \
+            --env BUILD_UID="$(id -u)" \
+            --volume "$build_dir:/pkg" \
+            --workdir /pkg \
+            archlinux:base-devel \
+            bash -euc '
+              useradd --uid "$BUILD_UID" --create-home builder
+              pacman -Syu --needed --noconfirm \
+                desktop-file-utils fuse2 hicolor-icon-theme
+              runuser -u builder -- makepkg --verifysource --force --noconfirm
+              runuser -u builder -- makepkg --force --noconfirm
+              desktop-file-validate \
+                pkg/relink-logs-appimage/usr/share/applications/gbfr-logs.desktop
+              test -L pkg/relink-logs-appimage/usr/bin/gbfr-logs
+              test -f \
+                pkg/relink-logs-appimage/usr/share/icons/hicolor/256x256@2/apps/gbfr-logs.png
+            '
+
+      - name: Detect recipe changes
+        id: changes
+        run: |
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit updated recipe
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          git config user.name 'ParticleG'
+          git config user.email 'particle_g@outlook.com'
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update relink-logs to ${VERSION}"
+          gh auth setup-git
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Publish to AUR
+        if: >-
+          steps.changes.outputs.changed == 'true' ||
+          github.event_name == 'push' ||
+          github.event_name == 'schedule' ||
+          github.event_name == 'repository_dispatch' ||
+          github.event.inputs.force_publish == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        with:
+          pkgname: relink-logs-appimage
+          pkgbuild: ./PKGBUILD
+          assets: |
+            .gitignore
+          commit_username: ParticleG
+          commit_email: particle_g@outlook.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ steps.upstream.outputs.version }}"
